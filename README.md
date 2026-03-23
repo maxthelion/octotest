@@ -1,15 +1,22 @@
 # octotest
 
-To install dependencies:
+Test health diagnostics for spec-driven projects. Grades your test suite against spec-derived invariants.
+
+## Usage
 
 ```bash
-bun install
+# Phase 1: Static analysis → JSON report
+bun run cli.ts scan --project /path/to/project
+
+# Generate HTML report from JSON
+bun run cli.ts report
 ```
 
-To run:
+Requires `.shoe-makers/invariants.md` and `.shoe-makers/claim-evidence.yaml` in the target project.
 
-```bash
-bun run index.ts
+## Shoe-makers integration
+
+```typescript
+import { getTestHealthResult } from "octotest/src/integrations/shoe-makers";
+const testHealth = getTestHealthResult(projectRoot);
 ```
-
-This project was created using `bun init` in bun v1.3.10. [Bun](https://bun.com) is a fast all-in-one JavaScript runtime.
