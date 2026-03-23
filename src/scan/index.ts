@@ -50,15 +50,14 @@ export function scan(projectRoot: string): InvariantScore[] {
   // Content cache to avoid re-reading files
   const contentCache = new Map<string, string>();
 
+  // Build claim-to-rule mapping
+  const claimRuleMap = buildClaimToRuleMap(claims, evidenceRules, ruleMap);
+
   // Score each claim
   const scores: InvariantScore[] = [];
 
   for (const claim of claims) {
-    // Try to find a matching evidence rule
-    // Evidence keys use slugs like "behaviour-tree.tree-evaluator"
-    // Claims have IDs like "what-a-user-can-do.set-up-and-go.0"
-    // We need to match claims to evidence rules
-    const rule = findRuleForClaim(claim, ruleMap, evidenceRules);
+    const rule = claimRuleMap.get(claim.id) ?? null;
 
     if (!rule) {
       // No evidence rule for this claim — untested by definition
@@ -128,45 +127,116 @@ export function scan(projectRoot: string): InvariantScore[] {
 }
 
 /**
- * Try to match a claim to an evidence rule.
+ * Build a lookup that maps each claim to its evidence rule.
  *
- * Evidence rules use keys like "behaviour-tree.tree-evaluator".
- * Claims have generated IDs. We try exact match first, then
- * fuzzy matching on the claim text against the rule ID.
+ * Strategy:
+ * 1. Exact claim ID match (claim.id === rule.claimId)
+ * 2. Prefix match: group evidence rules by their first N-1 dotted parts
+ *    (e.g., "bitmap-invariants.exclusion-rules"), group claims by
+ *    category+subcategory slug. Within a matching group, match by
+ *    position (order in file) or by fuzzy text similarity.
  */
-function findRuleForClaim(
-  claim: Claim,
-  ruleMap: Map<string, EvidenceRule>,
-  allRules: EvidenceRule[]
-): EvidenceRule | null {
-  // Exact ID match
-  if (ruleMap.has(claim.id)) return ruleMap.get(claim.id)!;
+function buildClaimToRuleMap(
+  claims: Claim[],
+  allRules: EvidenceRule[],
+  ruleMap: Map<string, EvidenceRule>
+): Map<string, EvidenceRule> {
+  const result = new Map<string, EvidenceRule>();
+  const usedRules = new Set<string>();
 
-  // Try matching by subcategory slug in the evidence key
-  // Evidence keys are like "category-slug.claim-slug"
-  // Our claim IDs are like "category-slug.subcategory-slug.index"
-  for (const rule of allRules) {
-    const parts = rule.claimId.split(".");
-    if (parts.length >= 2) {
-      const ruleCategory = parts[0];
-      // Check if the rule's category matches the claim's category or subcategory
-      const claimCatSlug = slugify(claim.category);
-      const claimSubSlug = claim.subcategory ? slugify(claim.subcategory) : null;
-
-      if (ruleCategory === claimCatSlug || ruleCategory === claimSubSlug) {
-        // Fuzzy: check if any pattern words from the rule ID appear in the claim text
-        const ruleSlug = parts.slice(1).join("-");
-        const ruleWords = ruleSlug.split("-").filter((w) => w.length > 2);
-        const claimLower = claim.text.toLowerCase();
-        const matchCount = ruleWords.filter((w) => claimLower.includes(w)).length;
-        if (matchCount >= Math.ceil(ruleWords.length * 0.5)) {
-          return rule;
-        }
-      }
+  // Pass 1: exact ID match
+  for (const claim of claims) {
+    if (ruleMap.has(claim.id)) {
+      result.set(claim.id, ruleMap.get(claim.id)!);
+      usedRules.add(claim.id);
     }
   }
 
-  return null;
+  // Pass 2: group rules by prefix, match to claim groups by position + text
+  // Group evidence rules by prefix (all parts except the last)
+  const rulesByPrefix = new Map<string, EvidenceRule[]>();
+  for (const rule of allRules) {
+    if (usedRules.has(rule.claimId)) continue;
+    const parts = rule.claimId.split(".");
+    if (parts.length < 2) continue;
+    const prefix = parts.slice(0, -1).join(".");
+    if (!rulesByPrefix.has(prefix)) rulesByPrefix.set(prefix, []);
+    rulesByPrefix.get(prefix)!.push(rule);
+  }
+
+  // Group claims by category+subcategory slug
+  const claimsByGroup = new Map<string, Claim[]>();
+  for (const claim of claims) {
+    if (result.has(claim.id)) continue;
+    const catSlug = slugify(claim.category);
+    const subSlug = claim.subcategory ? slugify(claim.subcategory) : null;
+    const key = subSlug ? `${catSlug}.${subSlug}` : catSlug;
+    if (!claimsByGroup.has(key)) claimsByGroup.set(key, []);
+    claimsByGroup.get(key)!.push(claim);
+  }
+
+  // For each claim group, find a matching rule group
+  for (const [claimPrefix, groupClaims] of claimsByGroup) {
+    // Try exact prefix match first
+    let matchingRules = rulesByPrefix.get(claimPrefix);
+
+    // If no exact match, try matching just the last segment
+    if (!matchingRules) {
+      const lastSeg = claimPrefix.split(".").pop()!;
+      for (const [rulePrefix, rules] of rulesByPrefix) {
+        if (rulePrefix.endsWith(lastSeg) || rulePrefix.split(".").pop() === lastSeg) {
+          matchingRules = rules;
+          break;
+        }
+      }
+    }
+
+    if (!matchingRules || matchingRules.length === 0) continue;
+
+    // Match claims to rules within the group
+    // First try fuzzy text match, then fall back to positional
+    const remainingRules = [...matchingRules];
+
+    for (const claim of groupClaims) {
+      if (result.has(claim.id)) continue;
+
+      // Fuzzy: find the rule whose slug words best match the claim text
+      let bestRule: EvidenceRule | null = null;
+      let bestScore = 0;
+      let bestIdx = -1;
+
+      for (let i = 0; i < remainingRules.length; i++) {
+        const rule = remainingRules[i];
+        const lastPart = rule.claimId.split(".").pop()!;
+        const ruleWords = lastPart.split(/[-_]/).filter((w) => w.length > 2);
+        if (ruleWords.length === 0) continue;
+
+        const claimLower = claim.text.toLowerCase();
+        const matchCount = ruleWords.filter((w) => claimLower.includes(w.toLowerCase())).length;
+        const score = matchCount / ruleWords.length;
+
+        if (score > bestScore) {
+          bestScore = score;
+          bestRule = rule;
+          bestIdx = i;
+        }
+      }
+
+      // Accept if at least 30% of slug words match (lower threshold for longer slugs)
+      if (bestRule && bestScore >= 0.3) {
+        result.set(claim.id, bestRule);
+        remainingRules.splice(bestIdx, 1);
+      }
+    }
+
+    // Positional fallback: match remaining claims to remaining rules by order
+    const unmatchedClaims = groupClaims.filter((c) => !result.has(c.id));
+    for (let i = 0; i < Math.min(unmatchedClaims.length, remainingRules.length); i++) {
+      result.set(unmatchedClaims[i].id, remainingRules[i]);
+    }
+  }
+
+  return result;
 }
 
 function makeUntestedScore(claim: Claim): InvariantScore {
